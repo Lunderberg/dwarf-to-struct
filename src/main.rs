@@ -4,7 +4,7 @@ use clap::Parser as _;
 use itertools::Itertools as _;
 
 use fallible_iterator::FallibleIterator;
-use gimli::{DebuggingInformationEntry, Dwarf, Reader, Unit, UnitOffset, UnitRef};
+use gimli::{DebuggingInformationEntry, Dwarf, Reader, Unit, UnitOffset};
 use object::{Object, ObjectSection};
 
 mod errors;
@@ -32,6 +32,144 @@ struct SearchFilter {
     class_name: Option<String>,
     base_class_name: Option<String>,
     contained_class_name: Option<String>,
+}
+
+struct DwarfUnits<'a, R: Reader> {
+    dwarf: &'a Dwarf<R>,
+    units: Vec<Unit<R>>,
+}
+
+#[derive(Clone, Copy)]
+struct DwarfUnit<'a, R: Reader> {
+    dwarf: &'a Dwarf<R>,
+    units: &'a [Unit<R>],
+    unit: &'a Unit<R>,
+}
+
+struct ContextEntry<'a, R: Reader> {
+    dwarf: &'a Dwarf<R>,
+    units: &'a [Unit<R>],
+    unit: &'a Unit<R>,
+    entry: gimli::DebuggingInformationEntry<'a, 'a, R>,
+}
+
+impl<'a, R: Reader> DwarfUnits<'a, R> {
+    fn iter<'b>(&'b self) -> impl Iterator<Item = DwarfUnit<'b, R>> + 'b {
+        let dwarf = &self.dwarf;
+        let units = &self.units;
+        self.units
+            .iter()
+            .map(move |unit| DwarfUnit { dwarf, units, unit })
+    }
+}
+
+impl<'a, R: Reader> DwarfUnit<'a, R> {
+    fn iter(self) -> impl Iterator<Item = ContextEntry<'a, R>> + 'a {
+        self.unit.iter_root().map(move |entry| ContextEntry {
+            dwarf: self.dwarf,
+            units: self.units,
+            unit: self.unit,
+            entry,
+        })
+    }
+}
+
+impl<'a, R: Reader> ContextEntry<'a, R> {
+    fn iter_children(&self) -> impl Iterator<Item = Self> + '_ {
+        self.unit
+            .iter_children(self.entry.offset())
+            .map(|entry| Self { entry, ..*self })
+    }
+
+    fn iter_base_classes(&self) -> impl Iterator<Item = Self> + '_ {
+        self.iter_children()
+            .filter(|entry| entry.tag() == gimli::DW_TAG_inheritance)
+            .filter_map(|entry| entry.class())
+    }
+
+    fn iter_class_members(&self) -> impl Iterator<Item = Self> + '_ {
+        self.iter_children()
+            .filter(|entry| entry.tag() == gimli::DW_TAG_member)
+            .filter(|entry| entry.member_location().is_some())
+    }
+
+    fn tag(&self) -> gimli::DwTag {
+        self.entry.tag()
+    }
+
+    fn size_bytes(&self) -> Option<usize> {
+        self.entry
+            .attr_value(gimli::DW_AT_byte_size)
+            .unwrap()
+            .map(|attr_value| match attr_value {
+                gimli::AttributeValue::Udata(data) => data as usize,
+                _ => panic!("Invalid AttributeValue for byte size"),
+            })
+    }
+
+    fn name(&self) -> Option<String> {
+        self.entry
+            .attr_value(gimli::DW_AT_name)
+            .unwrap()
+            .map(|attr_value| {
+                self.dwarf
+                    .attr_string(self.unit, attr_value)
+                    .unwrap()
+                    .to_string_lossy()
+                    .unwrap()
+                    .into()
+            })
+    }
+
+    fn class(&self) -> Option<Self> {
+        self.entry
+            .attr_value(gimli::DW_AT_type)
+            .unwrap()
+            .map(|attr_value| match attr_value {
+                gimli::AttributeValue::UnitRef(offset) => {
+                    // This is the same as
+                    // `unit.entry(offset).unwrap()`, but isn't
+                    // restricted to the the lifetime of the temporary
+                    // view produced by Deref.
+                    let entry = self.unit.entry(offset).unwrap();
+                    Self { entry, ..*self }
+                }
+
+                gimli::AttributeValue::DebugInfoRef(offset) => {
+                    let (unit, offset) = self
+                        .units
+                        .iter()
+                        .find_map(|unit| {
+                            offset
+                                .to_unit_offset(&unit.header)
+                                .map(|offset| (unit, offset))
+                        })
+                        .unwrap_or_else(|| panic!("Could not find {offset:?} in any CU"));
+                    let entry = unit.entry(offset).unwrap();
+                    Self {
+                        entry,
+                        unit,
+                        ..*self
+                    }
+                }
+
+                other => panic!(
+                    "Invalid AttributeValue for type, \
+                     must be reference into debug info section, \
+                     but instead was {other:?}."
+                ),
+            })
+    }
+
+    fn member_location(&self) -> Option<usize> {
+        self.entry
+            .attr_value(gimli::DW_AT_data_member_location)
+            .unwrap()
+            .map(|attr_value| match attr_value {
+                gimli::AttributeValue::Udata(data) => data as usize,
+                _ => panic!("Invalid AttributeValue for member location"),
+            })
+    }
 }
 
 struct EntryChildrenIterator<'a, 'b, R: Reader> {
@@ -104,184 +242,69 @@ impl<R: Reader> UnitExt<R> for Unit<R> {
     }
 }
 
-trait EntryExt<R: Reader> {
-    fn name(&self, unit: UnitRef<R>) -> Option<String>;
-
-    fn size_bytes(&self) -> Option<usize>;
-
-    fn member_location(&self) -> Option<usize>;
-
-    fn class<'a>(&self, unit: UnitRef<'a, R>) -> Option<DebuggingInformationEntry<'a, 'a, R>>;
-
-    fn iter_children<'a>(
-        &self,
-        unit: &'a Unit<R>,
-    ) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a;
-
-    fn iter_base_classes<'a>(
-        &self,
-        unit: UnitRef<'a, R>,
-    ) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a,
-    {
-        self.iter_children(unit.unit)
-            .filter(|child| child.tag() == gimli::DW_TAG_inheritance)
-            .filter_map(move |child| child.class(unit))
-    }
-
-    fn iter_member_classes<'a>(
-        &self,
-        unit: UnitRef<'a, R>,
-    ) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a,
-    {
-        self.iter_children(unit.unit)
-            .filter(|child| child.tag() == gimli::DW_TAG_member)
-            .filter(|child| child.member_location().is_some())
-            .filter_map(move |child| child.class(unit))
-    }
-}
-
-impl<'a, 'b, R: Reader> EntryExt<R> for DebuggingInformationEntry<'a, 'b, R> {
-    fn name(&self, unit: UnitRef<R>) -> Option<String> {
-        self.attr_value(gimli::DW_AT_name)
-            .unwrap()
-            .map(|attr_value| {
-                unit.attr_string(attr_value)
-                    .unwrap()
-                    .to_string_lossy()
-                    .unwrap()
-                    .into()
-            })
-    }
-
-    fn size_bytes(&self) -> Option<usize> {
-        self.attr_value(gimli::DW_AT_byte_size)
-            .unwrap()
-            .map(|attr_value| match attr_value {
-                gimli::AttributeValue::Udata(data) => data as usize,
-                _ => panic!("Invalid AttributeValue for byte size"),
-            })
-    }
-
-    fn member_location(&self) -> Option<usize> {
-        self.attr_value(gimli::DW_AT_data_member_location)
-            .unwrap()
-            .map(|attr_value| match attr_value {
-                gimli::AttributeValue::Udata(data) => data as usize,
-                _ => panic!("Invalid AttributeValue for member location"),
-            })
-    }
-
-    fn class<'c>(&self, unit: UnitRef<'c, R>) -> Option<DebuggingInformationEntry<'c, 'c, R>> {
-        self.attr_value(gimli::DW_AT_type)
-            .unwrap()
-            .map(|attr_value| match attr_value {
-                gimli::AttributeValue::UnitRef(offset) => {
-                    // This is the same as
-                    // `unit.entry(offset).unwrap()`, but isn't
-                    // restricted to the the lifetime of the temporary
-                    // view produced by Deref.
-                    unit.unit.entry(offset).unwrap()
-                }
-
-                gimli::AttributeValue::DebugInfoRef(offset) => {
-                    todo!(
-                        "Need to expose other compilation units \
-                         for cross-CU reference {offset:?}"
-                    )
-                    // offset.to_debug_info_offset(&unit.unit.header).unwrap()
-                }
-
-                other => panic!(
-                    "Invalid AttributeValue for type, \
-                     must be reference into debug info section, \
-                     but instead was {other:?}."
-                ),
-            })
-    }
-
-    fn iter_children<'c>(
-        &self,
-        unit: &'c Unit<R>,
-    ) -> impl Iterator<Item = DebuggingInformationEntry<'c, 'c, R>> + 'c
-    where
-        R: 'c,
-        R::Offset: 'c,
-    {
-        unit.iter_children(self.offset())
-    }
-}
-
 fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Result<(), Error> {
-    let units: Vec<_> = dwarf.units().map(|header| dwarf.unit(header)).collect()?;
+    let dwarf_units = DwarfUnits {
+        dwarf,
+        units: dwarf.units().map(|header| dwarf.unit(header)).collect()?,
+    };
 
-    units
+    dwarf_units
         .iter()
-        .flat_map(|unit| {
-            let unit = unit.unit_ref(&dwarf);
-            unit.unit.iter_root().map(move |entry| (unit, entry))
-        })
-        .filter(|(_, entry)| entry.tag() == gimli::DW_TAG_class_type)
-        .filter(|(_, entry)| entry.attr_value(gimli::DW_AT_byte_size).unwrap().is_some())
-        .filter(|(unit, entry)| {
+        .flat_map(|unit| unit.iter())
+        .filter(|entry| entry.tag() == gimli::DW_TAG_class_type)
+        .filter(|entry| entry.size_bytes().is_some())
+        .filter(|entry| {
             if let Some(required_class_name) = search_filter.class_name.as_ref() {
                 entry
-                    .name(*unit)
+                    .name()
                     .map(|name| &name == required_class_name)
                     .unwrap_or(false)
             } else {
                 true
             }
         })
-        .filter(|(unit, entry)| {
+        .filter(|entry| {
             if let Some(required_base_class) = search_filter.base_class_name.as_ref() {
                 entry
-                    .iter_base_classes(*unit)
-                    .any(|base_class| base_class.name(*unit).as_ref() == Some(required_base_class))
+                    .iter_base_classes()
+                    .any(|base_class| base_class.name().as_ref() == Some(required_base_class))
             } else {
                 true
             }
         })
-        .filter(|(unit, entry)| {
+        .filter(|entry| {
             if let Some(required_member_class) = search_filter.contained_class_name.as_ref() {
-                entry.iter_member_classes(*unit).any(|base_class| {
-                    base_class.name(*unit).as_ref() == Some(required_member_class)
-                })
+                entry
+                    .iter_class_members()
+                    .filter_map(|member| member.class())
+                    .any(|class| class.name().as_ref() == Some(required_member_class))
             } else {
                 true
             }
         })
-        .unique_by(|(unit, entry)| entry.name(*unit))
+        .unique_by(|entry| entry.name())
         .enumerate()
-        .for_each(|(i, (unit, entry))| {
+        .for_each(|(i, entry)| {
             if i > 0 {
                 println!("");
             }
 
-            let name = entry.name(unit).unwrap();
+            let name = entry.name().unwrap();
             let size_bytes = entry.size_bytes().unwrap();
 
             println!("struct {name} {{ // {size_bytes} bytes");
 
             entry
-                .iter_children(&unit)
+                .iter_children()
                 .filter(|child| {
                     child.tag() == gimli::DW_TAG_member || child.tag() == gimli::DW_TAG_inheritance
                 })
                 .filter(|child| child.member_location().is_some())
                 .for_each(|child| {
-                    let class = child.class(unit).unwrap();
-                    let class_name = class.name(unit).unwrap_or_else(|| "unknown_class".into());
+                    let class = child.class().unwrap();
+                    let class_name = class.name().unwrap_or_else(|| "unknown_class".into());
 
-                    let name = child.name(unit).unwrap_or_else(|| "unknown_name".into());
+                    let name = child.name().unwrap_or_else(|| "unknown_name".into());
 
                     let field_size = class.size_bytes().unwrap_or(0);
 
