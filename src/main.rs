@@ -15,7 +15,7 @@ use relocation_map::*;
 
 #[derive(clap::Parser)]
 struct CommandLineInterface {
-    #[arg(long, value_name = "SHARED_OBJECT")]
+    #[arg(long = "shared-object", value_name = "PATH")]
     shared_object_path: Option<PathBuf>,
 
     #[arg(long = "name")]
