@@ -105,9 +105,13 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
                 gimli::AttributeValue::Udata(data) => data as usize,
                 _ => panic!("Invalid AttributeValue for byte size"),
             })
+            .or_else(|| {
+                (self.entry.tag() == gimli::DW_TAG_pointer_type)
+                    .then(|| std::mem::size_of::<usize>())
+            })
     }
 
-    fn name(&self) -> Option<String> {
+    fn name_from_tag(&self) -> Option<String> {
         self.entry
             .attr_value(gimli::DW_AT_name)
             .unwrap()
@@ -119,6 +123,19 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
                     .unwrap()
                     .into()
             })
+    }
+
+    fn name_as_pointer(&self) -> Option<String> {
+        (self.tag() == gimli::DW_TAG_pointer_type)
+            .then(|| self.class())
+            .flatten()
+            .and_then(|pointee_type| pointee_type.name())
+            .map(|pointee_name| format!("{pointee_name}*"))
+    }
+
+    fn name(&self) -> Option<String> {
+        None.or_else(|| self.name_from_tag())
+            .or_else(|| self.name_as_pointer())
     }
 
     fn class(&self) -> Option<Self> {
@@ -159,6 +176,14 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
                      but instead was {other:?}."
                 ),
             })
+    }
+
+    fn expand_type_defs(self) -> Self {
+        std::iter::successors(Some(self), |entry| {
+            (entry.tag() == gimli::DW_TAG_typedef).then(|| entry.class().unwrap())
+        })
+        .last()
+        .unwrap()
     }
 
     fn member_location(&self) -> Option<usize> {
@@ -301,7 +326,7 @@ fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Resul
                 })
                 .filter(|child| child.member_location().is_some())
                 .for_each(|child| {
-                    let class = child.class().unwrap();
+                    let class = child.class().unwrap().expand_type_defs();
                     let class_name = class.name().unwrap_or_else(|| "unknown_class".into());
 
                     let name = child.name().unwrap_or_else(|| "unknown_name".into());
