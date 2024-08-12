@@ -65,7 +65,13 @@ impl<'a, R: Reader> DwarfUnits<'a, R> {
 
 impl<'a, R: Reader> DwarfUnit<'a, R> {
     fn iter(self) -> impl Iterator<Item = ContextEntry<'a, R>> + 'a {
-        self.unit.iter_root().map(move |entry| ContextEntry {
+        let iter_raw_entry = {
+            let mut cursor = self.unit.entries();
+            assert!(cursor.next_dfs().unwrap().is_some());
+            EntryChildrenIterator::new(cursor)
+        };
+
+        iter_raw_entry.map(move |entry| ContextEntry {
             dwarf: self.dwarf,
             units: self.units,
             unit: self.unit,
@@ -76,9 +82,14 @@ impl<'a, R: Reader> DwarfUnit<'a, R> {
 
 impl<'a, R: Reader> ContextEntry<'a, R> {
     fn iter_children(&self) -> impl Iterator<Item = Self> + '_ {
-        self.unit
-            .iter_children(self.entry.offset())
-            .map(|entry| Self { entry, ..*self })
+        let iter_raw_entry = {
+            let offset = self.entry.offset();
+            let mut cursor = self.unit.entries_at_offset(offset).unwrap();
+            assert!(cursor.next_dfs().unwrap().is_some());
+            EntryChildrenIterator::new(cursor)
+        };
+
+        iter_raw_entry.map(|entry| Self { entry, ..*self })
     }
 
     fn iter_base_classes(&self) -> impl Iterator<Item = Self> + '_ {
@@ -228,45 +239,6 @@ impl<'a, 'b, R: Reader> Iterator for EntryChildrenIterator<'a, 'b, R> {
     }
 }
 
-trait UnitExt<R: Reader> {
-    fn iter_root<'a>(&'a self) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a;
-
-    fn iter_children<'a>(
-        &'a self,
-        offset: UnitOffset<R::Offset>,
-    ) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a;
-}
-impl<R: Reader> UnitExt<R> for Unit<R> {
-    fn iter_root<'a>(&'a self) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a,
-    {
-        let mut cursor = self.entries();
-        assert!(cursor.next_dfs().unwrap().is_some());
-        EntryChildrenIterator::new(cursor)
-    }
-
-    fn iter_children<'a>(
-        &'a self,
-        offset: UnitOffset<R::Offset>,
-    ) -> impl Iterator<Item = DebuggingInformationEntry<'a, 'a, R>> + 'a
-    where
-        R: 'a,
-        R::Offset: 'a,
-    {
-        let mut cursor = self.entries_at_offset(offset).unwrap();
-        assert!(cursor.next_dfs().unwrap().is_some());
-        EntryChildrenIterator::new(cursor)
-    }
-}
-
 fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Result<(), Error> {
     let dwarf_units = DwarfUnits {
         dwarf,
@@ -317,6 +289,8 @@ fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Resul
             let name = entry.name().unwrap();
             let size_bytes = entry.size_bytes().unwrap();
 
+            // TODO: Align the comments for readability.
+
             println!("struct {name} {{ // {size_bytes} bytes");
 
             entry
@@ -327,10 +301,15 @@ fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Resul
                 .filter(|child| child.member_location().is_some())
                 .for_each(|child| {
                     let class = child.class().unwrap().expand_type_defs();
+
+                    // TODO: Expand anonymous enums and structs
                     let class_name = class.name().unwrap_or_else(|| "unknown_class".into());
 
                     let name = child.name().unwrap_or_else(|| "unknown_name".into());
 
+                    // TODO: Check for the `DW_AT_bit_size` and
+                    // `DW_AT_bit_offset` fields, to see if this
+                    // member is part of a bitfield.
                     let field_size = class.size_bytes().unwrap_or(0);
 
                     let field_start = child.member_location().unwrap();
@@ -338,8 +317,8 @@ fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Resul
 
                     println!(
                         "    {class_name} {name}; \
-                                     // {field_size} bytes, \
-                                     {field_start}-{field_end}"
+                         // {field_size} bytes, \
+                         {field_start}-{field_end}"
                     );
                 });
 
