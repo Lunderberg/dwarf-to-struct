@@ -223,80 +223,80 @@ impl<'a, 'b, R: Reader> EntryExt<R> for DebuggingInformationEntry<'a, 'b, R> {
 fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Result<(), Error> {
     let units: Vec<_> = dwarf.units().map(|header| dwarf.unit(header)).collect()?;
 
-    units.iter().for_each(|unit| {
-        let unit = unit.unit_ref(&dwarf);
-
-        unit.iter_root()
-            .filter(|entry| entry.tag() == gimli::DW_TAG_class_type)
-            .filter(|entry| entry.attr_value(gimli::DW_AT_byte_size).unwrap().is_some())
-            .filter(|entry| {
-                if let Some(required_class_name) = search_filter.class_name.as_ref() {
-                    entry
-                        .name(unit)
-                        .map(|name| &name == required_class_name)
-                        .unwrap_or(false)
-                } else {
-                    true
-                }
-            })
-            .filter(|entry| {
-                if let Some(required_base_class) = search_filter.base_class_name.as_ref() {
-                    entry.iter_base_classes(unit).any(|base_class| {
-                        base_class.name(unit).as_ref() == Some(required_base_class)
-                    })
-                } else {
-                    true
-                }
-            })
-            .filter(|entry| {
-                if let Some(required_member_class) = search_filter.contained_class_name.as_ref() {
-                    entry.iter_member_classes(unit).any(|base_class| {
-                        base_class.name(unit).as_ref() == Some(required_member_class)
-                    })
-                } else {
-                    true
-                }
-            })
-            .unique_by(|entry| entry.name(unit))
-            .enumerate()
-            .for_each(|(i, entry)| {
-                if i > 0 {
-                    println!("");
-                }
-
-                let name = entry.name(unit).unwrap();
-                let size_bytes = entry.size_bytes().unwrap();
-
-                println!("struct {name} {{ // {size_bytes} bytes");
-
+    units
+        .iter()
+        .flat_map(|unit| {
+            let unit = unit.unit_ref(&dwarf);
+            unit.unit.iter_root().map(move |entry| (unit, entry))
+        })
+        .filter(|(_, entry)| entry.tag() == gimli::DW_TAG_class_type)
+        .filter(|(_, entry)| entry.attr_value(gimli::DW_AT_byte_size).unwrap().is_some())
+        .filter(|(unit, entry)| {
+            if let Some(required_class_name) = search_filter.class_name.as_ref() {
                 entry
-                    .iter_children(&unit)
-                    .filter(|child| {
-                        child.tag() == gimli::DW_TAG_member
-                            || child.tag() == gimli::DW_TAG_inheritance
-                    })
-                    .filter(|child| child.member_location().is_some())
-                    .for_each(|child| {
-                        let class = child.class(unit).unwrap();
-                        let class_name = class.name(unit).unwrap_or_else(|| "unknown_class".into());
+                    .name(*unit)
+                    .map(|name| &name == required_class_name)
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .filter(|(unit, entry)| {
+            if let Some(required_base_class) = search_filter.base_class_name.as_ref() {
+                entry
+                    .iter_base_classes(*unit)
+                    .any(|base_class| base_class.name(*unit).as_ref() == Some(required_base_class))
+            } else {
+                true
+            }
+        })
+        .filter(|(unit, entry)| {
+            if let Some(required_member_class) = search_filter.contained_class_name.as_ref() {
+                entry.iter_member_classes(*unit).any(|base_class| {
+                    base_class.name(*unit).as_ref() == Some(required_member_class)
+                })
+            } else {
+                true
+            }
+        })
+        .unique_by(|(unit, entry)| entry.name(*unit))
+        .enumerate()
+        .for_each(|(i, (unit, entry))| {
+            if i > 0 {
+                println!("");
+            }
 
-                        let name = child.name(unit).unwrap_or_else(|| "unknown_name".into());
+            let name = entry.name(unit).unwrap();
+            let size_bytes = entry.size_bytes().unwrap();
 
-                        let field_size = class.size_bytes().unwrap_or(0);
+            println!("struct {name} {{ // {size_bytes} bytes");
 
-                        let field_start = child.member_location().unwrap();
-                        let field_end = field_start + field_size;
+            entry
+                .iter_children(&unit)
+                .filter(|child| {
+                    child.tag() == gimli::DW_TAG_member || child.tag() == gimli::DW_TAG_inheritance
+                })
+                .filter(|child| child.member_location().is_some())
+                .for_each(|child| {
+                    let class = child.class(unit).unwrap();
+                    let class_name = class.name(unit).unwrap_or_else(|| "unknown_class".into());
 
-                        println!(
-                            "    {class_name} {name}; \
+                    let name = child.name(unit).unwrap_or_else(|| "unknown_name".into());
+
+                    let field_size = class.size_bytes().unwrap_or(0);
+
+                    let field_start = child.member_location().unwrap();
+                    let field_end = field_start + field_size;
+
+                    println!(
+                        "    {class_name} {name}; \
                                      // {field_size} bytes, \
                                      {field_start}-{field_end}"
-                        );
-                    });
+                    );
+                });
 
-                println!("}};");
-            });
-    });
+            println!("}};");
+        });
 
     Ok(())
 }
