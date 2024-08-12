@@ -4,7 +4,7 @@ use clap::Parser as _;
 use itertools::Itertools as _;
 
 use fallible_iterator::FallibleIterator;
-use gimli::{DebuggingInformationEntry, Dwarf, Reader, Unit, UnitOffset};
+use gimli::{Dwarf, Reader, Unit};
 use object::{Object, ObjectSection};
 
 mod errors;
@@ -28,17 +28,34 @@ struct CommandLineInterface {
     contained_class_name: Option<String>,
 }
 
+/// Represents the user's search options, as specified on the command
+/// line.
 struct SearchFilter {
+    /// If present, only print classes whose name matches the
+    /// `class_name`.
     class_name: Option<String>,
+
+    /// If present, only print classes that inherit from a class whose
+    /// name matches the `base_class_name`.
     base_class_name: Option<String>,
+
+    /// If present, only print classes that contain at least one
+    /// member whose name matched the `contained_class_name`.
     contained_class_name: Option<String>,
 }
 
+/// The compilation units found.  Since a DIE may refer to symbols at
+/// an arbitrary location in the .debug_info section, storing all
+/// headers allows them to be inspected without re-parsing through
+/// `gimli::Dwarf::units()`
 struct DwarfUnits<'a, R: Reader> {
     dwarf: &'a Dwarf<R>,
     units: Vec<Unit<R>>,
 }
 
+/// Handles into a specific compilation unit.  Similar to the
+/// `gimli::UnitRef` struct, but also contains a reference to the
+/// other compilation units owned by the same Dwarf unpacker.
 #[derive(Clone, Copy)]
 struct DwarfUnit<'a, R: Reader> {
     dwarf: &'a Dwarf<R>,
@@ -46,24 +63,47 @@ struct DwarfUnit<'a, R: Reader> {
     unit: &'a Unit<R>,
 }
 
+/// Represents a single DWARF Debugging Information Entry (DIE), along
+/// with handles into the structures that may be required to interpret
+/// the DIE.
 struct ContextEntry<'a, R: Reader> {
+    /// The Dwarf unpacker that contains the entry.  Used to expand
+    /// strings that may reside in the .debug_str section.
     dwarf: &'a Dwarf<R>,
+
+    /// The compilation units contained in the Dwarf unpacker.  Used
+    /// to expand references that point relative to .debug_info.
     units: &'a [Unit<R>],
+
+    /// The compilation unit that contains the entry.  Used to expand
+    /// references that point relative to the current compilation
+    /// unit.
     unit: &'a Unit<R>,
+
+    /// The entry itself.
     entry: gimli::DebuggingInformationEntry<'a, 'a, R>,
 }
 
 impl<'a, R: Reader> DwarfUnits<'a, R> {
+    /// Construct a new instance.  Propagates any errors that result
+    /// from unpacking the DWARF headers.
+    fn new(dwarf: &'a Dwarf<R>) -> Result<Self, gimli::Error> {
+        let units = dwarf.units().map(|header| dwarf.unit(header)).collect()?;
+        Ok(Self { dwarf, units })
+    }
+
+    /// Iterate over all compilation units.
     fn iter<'b>(&'b self) -> impl Iterator<Item = DwarfUnit<'b, R>> + 'b {
-        let dwarf = &self.dwarf;
-        let units = &self.units;
-        self.units
-            .iter()
-            .map(move |unit| DwarfUnit { dwarf, units, unit })
+        self.units.iter().map(move |unit| DwarfUnit {
+            dwarf: &self.dwarf,
+            units: &self.units,
+            unit,
+        })
     }
 }
 
 impl<'a, R: Reader> DwarfUnit<'a, R> {
+    /// Iterate over top-level entries of the compilation unit.
     fn iter(self) -> impl Iterator<Item = ContextEntry<'a, R>> + 'a {
         let iter_raw_entry = {
             let mut cursor = self.unit.entries();
@@ -81,6 +121,7 @@ impl<'a, R: Reader> DwarfUnit<'a, R> {
 }
 
 impl<'a, R: Reader> ContextEntry<'a, R> {
+    /// Iterate over children of the current entry.
     fn iter_children(&self) -> impl Iterator<Item = Self> + '_ {
         let iter_raw_entry = {
             let offset = self.entry.offset();
@@ -92,23 +133,53 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
         iter_raw_entry.map(|entry| Self { entry, ..*self })
     }
 
+    /// Returns the DWARF tag of the entry.
+    fn tag(&self) -> gimli::DwTag {
+        self.entry.tag()
+    }
+
     fn iter_base_classes(&self) -> impl Iterator<Item = Self> + '_ {
+        debug_assert!(
+            self.tag() == gimli::DW_TAG_class_type,
+            "Iterating over base classes \
+             should only occur for type definitions (DW_TAG_class_type), \
+             but was used for an entry with tag {}.",
+            self.tag(),
+        );
         self.iter_children()
             .filter(|entry| entry.tag() == gimli::DW_TAG_inheritance)
             .filter_map(|entry| entry.class())
     }
 
     fn iter_class_members(&self) -> impl Iterator<Item = Self> + '_ {
+        debug_assert!(
+            self.tag() == gimli::DW_TAG_class_type,
+            "Iterating over class members \
+             should only occur for type definitions (DW_TAG_class_type), \
+             but was used for an entry with tag {}.",
+            self.tag(),
+        );
         self.iter_children()
             .filter(|entry| entry.tag() == gimli::DW_TAG_member)
             .filter(|entry| entry.member_location().is_some())
     }
 
-    fn tag(&self) -> gimli::DwTag {
-        self.entry.tag()
-    }
-
+    /// Returns the size of the class described.
     fn size_bytes(&self) -> Option<usize> {
+        debug_assert!(
+            self.tag() == gimli::DW_TAG_class_type
+                || self.tag() == gimli::DW_TAG_structure_type
+                || self.tag() == gimli::DW_TAG_union_type
+                || self.tag() == gimli::DW_TAG_enumeration_type
+                || self.tag() == gimli::DW_TAG_base_type
+                || self.tag() == gimli::DW_TAG_inheritance
+                || self.tag() == gimli::DW_TAG_pointer_type,
+            "The size of a class can only be determined \
+             should only occur for type definitions \
+             (DW_TAG_class_type or DW_TAG_pointer_type), \
+             but `entry.size_bytes()` was used for an entry with tag {}.",
+            self.tag(),
+        );
         self.entry
             .attr_value(gimli::DW_AT_byte_size)
             .unwrap()
@@ -122,6 +193,8 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
             })
     }
 
+    /// Returns the name of the entry, considering only the DW_AT_name
+    /// attribute.
     fn name_from_tag(&self) -> Option<String> {
         self.entry
             .attr_value(gimli::DW_AT_name)
@@ -136,6 +209,7 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
             })
     }
 
+    /// Returns the name of the pointed-to type.
     fn name_as_pointer(&self) -> Option<String> {
         (self.tag() == gimli::DW_TAG_pointer_type)
             .then(|| self.class())
@@ -144,12 +218,20 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
             .map(|pointee_name| format!("{pointee_name}*"))
     }
 
+    /// Returns the name of the entity being described.
     fn name(&self) -> Option<String> {
         None.or_else(|| self.name_from_tag())
             .or_else(|| self.name_as_pointer())
     }
 
+    /// Returns the class of the entity being described.
     fn class(&self) -> Option<Self> {
+        debug_assert!(
+            self.tag() != gimli::DW_TAG_class_type,
+            "There is no class of a class \
+             but the `entry.class()` method was used \
+             for an entry with tag DW_TAG_class_type."
+        );
         self.entry
             .attr_value(gimli::DW_AT_type)
             .unwrap()
@@ -158,7 +240,10 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
                     // This is the same as
                     // `unit.entry(offset).unwrap()`, but isn't
                     // restricted to the the lifetime of the temporary
-                    // view produced by Deref.
+                    // view produced by Deref.  This allows the
+                    // returned `ContextEntry<'a, R>` to use the
+                    // lifetime 'a, rather than the lifetime of this
+                    // method's `&self` parameter.
                     let entry = self.unit.entry(offset).unwrap();
                     Self { entry, ..*self }
                 }
@@ -189,6 +274,7 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
             })
     }
 
+    /// Expand `DW_TAG_typedef` tag into the pointed-to type.
     fn expand_type_defs(self) -> Self {
         std::iter::successors(Some(self), |entry| {
             (entry.tag() == gimli::DW_TAG_typedef).then(|| entry.class().unwrap())
@@ -197,7 +283,16 @@ impl<'a, R: Reader> ContextEntry<'a, R> {
         .unwrap()
     }
 
+    /// Return the location of the member.
     fn member_location(&self) -> Option<usize> {
+        debug_assert!(
+            self.tag() == gimli::DW_TAG_member || self.tag() == gimli::DW_TAG_inheritance,
+            "The location of a data member can only be determined \
+             for a data member, \
+             but `entry.member_location()` was used \
+             for an entry with tag {}.",
+            self.tag(),
+        );
         self.entry
             .attr_value(gimli::DW_AT_data_member_location)
             .unwrap()
@@ -240,10 +335,7 @@ impl<'a, 'b, R: Reader> Iterator for EntryChildrenIterator<'a, 'b, R> {
 }
 
 fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Result<(), Error> {
-    let dwarf_units = DwarfUnits {
-        dwarf,
-        units: dwarf.units().map(|header| dwarf.unit(header)).collect()?,
-    };
+    let dwarf_units = DwarfUnits::new(dwarf)?;
 
     dwarf_units
         .iter()
@@ -305,7 +397,13 @@ fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Resul
                     // TODO: Expand anonymous enums and structs
                     let class_name = class.name().unwrap_or_else(|| "unknown_class".into());
 
-                    let name = child.name().unwrap_or_else(|| "unknown_name".into());
+                    // TODO: Print base classes as base classes,
+                    // rather than as members.
+                    let name = if child.tag() == gimli::DW_TAG_inheritance {
+                        "_base_class".into()
+                    } else {
+                        child.name().unwrap_or_else(|| "unknown_name".into())
+                    };
 
                     // TODO: Check for the `DW_AT_bit_size` and
                     // `DW_AT_bit_offset` fields, to see if this
@@ -315,6 +413,8 @@ fn dump_file<R: Reader>(dwarf: &Dwarf<R>, search_filter: &SearchFilter) -> Resul
                     let field_start = child.member_location().unwrap();
                     let field_end = field_start + field_size;
 
+                    // TODO: Highlight the part of the structure that
+                    // matched the SearchFilter.
                     println!(
                         "    {class_name} {name}; \
                          // {field_size} bytes, \
